@@ -8,16 +8,27 @@
 
 package tslab
 
-import "fmt"
+import (
+	"fmt"
+)
 
-// typed pointer to the object on Heap
-type Ptr[T any] uint32
-
-func (ptr Ptr[T]) ref() ref {
-	return ref{slabID: int(ptr >> 16), slotID: int(ptr & 0xffff)}
+type X[T any] struct {
+	Ref *T
+	len int
+	cap int
 }
 
-func (ptr Ptr[T]) IsNil() bool { return ptr == 0 }
+// typed pointer to the object on Heap
+type Pointer[T any] uint64
+
+func (p Pointer[T]) IsNil() bool { return p == 0 }
+
+func (p Pointer[T]) slabID() int { return int(p >> 32) }
+func (p Pointer[T]) slotID() int { return int(p & 0xffffffff) }
+
+func newPointer[T any](slabID, slotID int) Pointer[T] {
+	return Pointer[T](slabID<<32 | slotID)
+}
 
 type Stats struct {
 	NumAllocs  int
@@ -41,7 +52,7 @@ type Heap[T any] struct {
 type tslabs[T any] struct {
 	seq []*tslab[T]
 
-	freeSlots      ref
+	freeSlots      Pointer[T]
 	freeSlotsCount int
 	slotsCount     int
 }
@@ -53,25 +64,15 @@ type tslab[T any] struct {
 	// object heap memory
 	memory []T
 	// metadata about memory chunks
-	slots []slot
+	slots []slot[T]
 }
 
 // metadata about slots available on slab
-type slot struct {
+type slot[T any] struct {
 	refs int32
-	self ref
-	next ref
+	self Pointer[T]
+	next Pointer[T]
 }
-
-// reference to slot
-type ref struct {
-	slabID int
-	slotID int
-}
-
-func (ref ref) isNil() bool { return ref.slabID == -1 && ref.slotID == -1 }
-
-var nilRef = ref{-1, -1}
 
 // status of slab
 type tslabStatus int
@@ -84,53 +85,58 @@ const (
 
 // Create new heap for objects of type T
 func New[T any](chunkSize int) *Heap[T] {
-	if chunkSize >= 64*1024 {
-		chunkSize = 64*1024 - 1
-	}
-
 	return &Heap[T]{
-		slabs:     tslabs[T]{freeSlots: nilRef},
+		slabs: tslabs[T]{
+			freeSlots: Pointer[T](0),
+		},
 		chunkSize: chunkSize,
 	}
 }
 
 // Allocate object from heap
-func (h *Heap[T]) Alloc() (Ptr[T], *T) {
+func (h *Heap[T]) Alloc() (Pointer[T], *T) {
 	h.statsAllocs++
 
 	slot := h.slabs.alloc(h.chunkSize)
-	slab := h.slabs.seq[slot.self.slabID]
-	if slab.status != tslab_dirty {
-		slab.status = tslab_dirty
-		h.statsSlabsDirty++
-	}
+	obj := h.slabs.fetchObject(slot)
 
-	return h.slabs.fetchSlot(slot)
+	// TODO: slab stats
+	// slab := h.slabs.seq[slot.self.slabID]
+	// if slab.status != tslab_dirty {
+	// 	slab.status = tslab_dirty
+	// 	h.statsSlabsDirty++
+	// }
+
+	return slot.self, obj
 }
 
 // Get object by pointer
-func (h *Heap[T]) Get(ptr Ptr[T]) *T {
-	if ptr.IsNil() {
+func (h *Heap[T]) Get(p Pointer[T]) *T {
+	if p.IsNil() {
 		return nil
 	}
 
-	slot := h.slabs.refToSlot(ptr.ref())
+	slot := h.slabs.fetchSlot(p)
 	if slot.refs == 0 {
 		return nil
 	}
 
-	_, obj := h.slabs.fetchSlot(slot)
+	obj := h.slabs.fetchObject(slot)
 	return obj
 }
 
 // Free memory allocated to pointer
-func (h *Heap[T]) Free(ptr Ptr[T]) {
-	slot := h.slabs.refToSlot(ptr.ref())
+func (h *Heap[T]) Free(p Pointer[T]) {
+	if p.IsNil() {
+		return
+	}
+
+	slot := h.slabs.fetchSlot(p)
 	if slot.refs == 0 {
 		return
 	}
 
-	slab := h.slabs.seq[slot.self.slabID]
+	slab := h.slabs.seq[slot.self.slabID()]
 	slot.refs = 0
 
 	if slab.status != tslab_dirty {
@@ -161,8 +167,8 @@ func (h *Heap[T]) Dump() {
 // ---------------------------------------------------------------
 
 // allocates slab and slot from heap
-func (slabs *tslabs[T]) alloc(size int) *slot {
-	if slabs.freeSlots.isNil() {
+func (slabs *tslabs[T]) alloc(size int) *slot[T] {
+	if slabs.freeSlots.IsNil() {
 		slab := slabs.addSlab(len(slabs.seq), size)
 		slabs.seq = append(slabs.seq, slab)
 		slabs.slotsCount += size
@@ -172,17 +178,16 @@ func (slabs *tslabs[T]) alloc(size int) *slot {
 }
 
 // add empty slab
-func (slabs *tslabs[T]) addSlab(id, size int) *tslab[T] {
+func (slabs *tslabs[T]) addSlab(slabID, size int) *tslab[T] {
 	slab := &tslab[T]{
 		status: tslab_synced,
 		memory: make([]T, size, size),
-		slots:  make([]slot, size, size),
+		slots:  make([]slot[T], size, size),
 	}
 
-	for i := 1; i <= len(slab.slots); i++ {
-		c := &(slab.slots[i-1])
-		c.self.slabID = id
-		c.self.slotID = i
+	for slotID := len(slab.slots); slotID > 0; slotID-- {
+		c := &(slab.slots[slotID-1])
+		c.self = newPointer[T](slabID, slotID)
 		slabs.enqueueFreeSlot(c)
 	}
 
@@ -190,27 +195,19 @@ func (slabs *tslabs[T]) addSlab(id, size int) *tslab[T] {
 }
 
 // fetches object and its address behind memory slot
-func (slabs *tslabs[T]) fetchSlot(slot *slot) (Ptr[T], *T) {
-	slab := slabs.seq[slot.self.slabID]
-	slab.status = tslab_dirty
-
-	obj := &(slab.memory[slot.self.slotID-1])
-	ptr := Ptr[T](slot.self.slabID<<16 | slot.self.slotID)
-
-	return ptr, obj
+func (slabs *tslabs[T]) fetchObject(slot *slot[T]) *T {
+	obj := &(slabs.seq[slot.self.slabID()].memory[slot.self.slotID()-1])
+	return obj
 }
 
 // cast ref to
-func (slabs *tslabs[T]) refToSlot(ref ref) *slot {
-	if ref.isNil() {
-		return nil
-	}
-
-	return &(slabs.seq[ref.slabID].slots[ref.slotID-1])
+func (slabs *tslabs[T]) fetchSlot(p Pointer[T]) *slot[T] {
+	slot := &(slabs.seq[p.slabID()].slots[p.slotID()-1])
+	return slot
 }
 
 // release slot to heap
-func (slabs *tslabs[T]) enqueueFreeSlot(c *slot) {
+func (slabs *tslabs[T]) enqueueFreeSlot(c *slot[T]) {
 	if c.refs != 0 {
 		panic("slabs: enqueue no empty slot")
 	}
@@ -221,12 +218,12 @@ func (slabs *tslabs[T]) enqueueFreeSlot(c *slot) {
 }
 
 // allocate slot from heap
-func (slabs *tslabs[T]) dequeueFreeSlot() *slot {
-	if slabs.freeSlots.isNil() {
+func (slabs *tslabs[T]) dequeueFreeSlot() *slot[T] {
+	if slabs.freeSlots.IsNil() {
 		panic("slabs: out of memory")
 	}
 
-	c := slabs.refToSlot(slabs.freeSlots)
+	c := slabs.fetchSlot(slabs.freeSlots)
 
 	if c.refs != 0 {
 		panic("slabs: dequeue allocated slot")
@@ -234,7 +231,7 @@ func (slabs *tslabs[T]) dequeueFreeSlot() *slot {
 
 	c.refs = 1
 	slabs.freeSlots = c.next
-	c.next = nilRef
+	c.next = Pointer[T](0)
 	slabs.freeSlotsCount--
 
 	if slabs.freeSlotsCount < 0 {
