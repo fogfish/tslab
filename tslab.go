@@ -9,12 +9,10 @@
 package tslab
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 )
 
+// Typed pointer to the object on the heap
 type Pointer[T any] struct {
 	ValueOf *T
 	slabID  int
@@ -25,40 +23,34 @@ func (p Pointer[T]) String() string {
 	return fmt.Sprintf("(%p | %d, %d)", p.ValueOf, p.slabID, p.slotID)
 }
 
-func NewP[T any](slabID, slotID int) Pointer[T] {
-	return Pointer[T]{slabID: slabID, slotID: slotID}
+func (p Pointer[T]) IsNil() bool { return p.slabID == 0 && p.slotID == 0 }
+
+// Memory allocator
+type Allocator[T any] interface {
+	Alloc() Pointer[T]
+	Free(Pointer[T])
 }
 
-func (p Pointer[T]) MarshalBinary() ([]byte, error) {
-	var buf [8]byte
-
-	binary.BigEndian.PutUint32(buf[0:4], uint32(p.slabID))
-	binary.BigEndian.PutUint32(buf[4:8], uint32(p.slotID))
-
-	return buf[:], nil
-}
-
-func (p *Pointer[T]) UnmarshalBinary(data []byte) error {
-	p.slabID = int(binary.BigEndian.Uint32(data[0:4]))
-	p.slotID = int(binary.BigEndian.Uint32(data[4:8]))
-	return nil
+// Object relocator after recovery
+type Relocator[T any] interface {
+	Reloc(Pointer[T]) Pointer[T]
 }
 
 // Heap statistic
 type Stats struct {
-	NumAllocs  int
-	Slabs      int
-	SlabsDirty int
-	Slots      int
-	SlotsFree  int
+	NumAllocs int
+	NumFree   int
+	Slabs     int
+	Slots     int
+	SlotsFree int
 }
 
 // Typed Heap manages pool of objects on typed-slabs
 type Heap[T any] struct {
 	slabs tslabs[T]
 
-	statsAllocs     int
-	statsSlabsDirty int
+	statsAllocs int
+	statsFree   int
 }
 
 // Sequence of typed-slabs
@@ -84,34 +76,15 @@ type tslab[T any] struct {
 
 // metadata about slots available on slab
 type slot struct {
-	refs int32 // 4
-	self ref   // 4 + 4
-	next ref   // 4 + 4
-}
-
-func (slot slot) MarshalBinary() ([]byte, error) {
-	var buf [12]byte
-
-	binary.BigEndian.PutUint32(buf[0:4], uint32(slot.refs))
-	binary.BigEndian.PutUint32(buf[4:8], uint32(slot.self.slotID))
-	binary.BigEndian.PutUint32(buf[8:12], uint32(slot.self.slabID))
-
-	return buf[:], nil
-}
-
-func (slot *slot) UnmarshalBinary(data []byte) error {
-	// TODO: fix order
-	slot.refs = int32(binary.BigEndian.Uint32(data[0:4]))
-	slot.self.slotID = int(binary.BigEndian.Uint32(data[4:8]))
-	slot.self.slabID = int(binary.BigEndian.Uint32(data[8:12]))
-	slot.next = nilRef
-	return nil
+	refs int32
+	self ref
+	next ref
 }
 
 // reference to slot
 type ref struct {
 	slabID int
-	slotID int // TODO: slotAddr
+	slotID int
 }
 
 func (ref ref) isNil() bool { return ref.slabID == -1 && ref.slotID == -1 }
@@ -122,16 +95,16 @@ var nilRef = ref{-1, -1}
 type tslabStatus int
 
 const (
-	tslab_synced tslabStatus = iota
-	tslab_dirty
+	tslab_present tslabStatus = iota
 	tslab_swapped
+	tslab_dirty
 )
 
 // Create new heap for objects of type T
-func New[T any](slabObjects int) *Heap[T] {
+func New[T any](objectsPerChunk int) *Heap[T] {
 	return &Heap[T]{
 		slabs: tslabs[T]{
-			slabObjects: slabObjects,
+			slabObjects: objectsPerChunk,
 			freeSlots:   nilRef,
 		},
 	}
@@ -139,16 +112,15 @@ func New[T any](slabObjects int) *Heap[T] {
 
 // Allocate object from heap
 func (h *Heap[T]) Alloc() Pointer[T] {
-	h.statsAllocs++
-
 	slot := h.slabs.alloc()
-	slab := h.slabs.seq[slot.self.slabID]
-	if slab.status != tslab_dirty {
-		slab.status = tslab_dirty
-		h.statsSlabsDirty++
-	}
+	// slab := h.slabs.seq[slot.self.slabID]
+	// if slab.status != tslab_dirty {
+	// 	slab.status = tslab_dirty
+	// }
 
 	obj := h.slabs.fetchSlot(slot)
+
+	h.statsAllocs++
 
 	return Pointer[T]{
 		ValueOf: obj,
@@ -158,8 +130,8 @@ func (h *Heap[T]) Alloc() Pointer[T] {
 }
 
 // Rebinds pointer
-func (h *Heap[T]) Get(p Pointer[T]) Pointer[T] {
-	return h.slabs.Get(p)
+func (h *Heap[T]) Reloc(p Pointer[T]) Pointer[T] {
+	return h.slabs.Reloc(p)
 }
 
 // Free memory allocated to pointer
@@ -170,24 +142,27 @@ func (h *Heap[T]) Free(p Pointer[T]) {
 		return
 	}
 
-	slab := h.slabs.seq[slot.self.slabID]
 	slot.refs = 0
-
-	if slab.status != tslab_dirty {
-		slab.status = tslab_dirty
-		h.statsSlabsDirty++
-	}
-
 	h.slabs.enqueueFreeSlot(slot)
+
+	h.statsFree++
+
+	// slab := h.slabs.seq[slot.self.slabID]
+	// if slab.status != tslab_dirty {
+	// 	slab.status = tslab_dirty
+	// 	h.statsSlabsDirty++
+	// }
+
 }
 
 func (h *Heap[T]) Stats() Stats {
 	return Stats{
-		NumAllocs:  h.statsAllocs,
-		Slabs:      len(h.slabs.seq),
-		SlabsDirty: h.statsSlabsDirty,
-		Slots:      h.slabs.slotsCount,
-		SlotsFree:  h.slabs.freeSlotsCount,
+		NumAllocs: h.statsAllocs,
+		NumFree:   h.statsFree,
+		Slabs:     len(h.slabs.seq),
+		// SlabsDirty: h.statsSlabsDirty,
+		Slots:     h.slabs.slotsCount,
+		SlotsFree: h.slabs.freeSlotsCount,
 	}
 }
 
@@ -198,26 +173,26 @@ func (h *Heap[T]) Dump() {
 	}
 }
 
-func (h *Heap[T]) DumpX() ([]byte, error) {
-	var wire bytes.Buffer
-	enc := gob.NewEncoder(&wire)
+// func (h *Heap[T]) DumpX() ([]byte, error) {
+// 	var wire bytes.Buffer
+// 	enc := gob.NewEncoder(&wire)
 
-	if err := enc.Encode(h.slabs); err != nil {
-		return nil, err
-	}
+// 	if err := enc.Encode(h.slabs); err != nil {
+// 		return nil, err
+// 	}
 
-	return wire.Bytes(), nil
-}
+// 	return wire.Bytes(), nil
+// }
 
-func (h *Heap[T]) UnDump(data []byte) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
+// func (h *Heap[T]) UnDump(data []byte) error {
+// 	dec := gob.NewDecoder(bytes.NewBuffer(data))
 
-	if err := dec.Decode(&h.slabs); err != nil {
-		return err
-	}
+// 	if err := dec.Decode(&h.slabs); err != nil {
+// 		return err
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 // ---------------------------------------------------------------
 
@@ -235,13 +210,13 @@ func (slabs *tslabs[T]) alloc() *slot {
 // add empty slab
 func (slabs *tslabs[T]) addSlab(slabID int) *tslab[T] {
 	slab := &tslab[T]{
-		status: tslab_synced,
+		status: tslab_present,
 		memory: make([]T, slabs.slabObjects, slabs.slabObjects),
 		slots:  make([]slot, slabs.slabObjects, slabs.slabObjects),
 	}
 
-	for slotID := len(slab.slots) - 1; slotID >= 0; slotID-- {
-		c := &(slab.slots[slotID])
+	for slotID := len(slab.slots); slotID > 0; slotID-- {
+		c := &(slab.slots[slotID-1])
 		c.self.slabID = slabID
 		c.self.slotID = slotID
 		slabs.enqueueFreeSlot(c)
@@ -255,7 +230,7 @@ func (slabs *tslabs[T]) fetchSlot(slot *slot) *T {
 	slab := slabs.seq[slot.self.slabID]
 	slab.status = tslab_dirty
 
-	return &slab.memory[slot.self.slotID]
+	return &slab.memory[slot.self.slotID-1]
 }
 
 // cast ref to
@@ -264,7 +239,7 @@ func (slabs *tslabs[T]) refToSlot(ref ref) *slot {
 		return nil
 	}
 
-	return &(slabs.seq[ref.slabID].slots[ref.slotID])
+	return &(slabs.seq[ref.slabID].slots[ref.slotID-1])
 }
 
 // release slot to heap
@@ -302,56 +277,31 @@ func (slabs *tslabs[T]) dequeueFreeSlot() *slot {
 	return c
 }
 
-func (slabs tslabs[T]) MarshalBinary() ([]byte, error) {
-	var wire bytes.Buffer
-	enc := gob.NewEncoder(&wire)
+// rebind pointers on slab
+func (slabs *tslabs[T]) remapSlab(slabID int) {
+	slab := slabs.seq[slabID]
 
-	if err := enc.Encode(slabs.seq); err != nil {
-		return nil, err
-	}
-
-	return wire.Bytes(), nil
-}
-
-func (slabs *tslabs[T]) UnmarshalBinary(data []byte) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
-
-	if err := dec.Decode(&slabs.seq); err != nil {
-		return err
-	}
-
-	for _, slab := range slabs.seq {
-		for _, slot := range slab.slots {
-			if slot.refs == 0 {
-				slabs.enqueueFreeSlot(&slot)
-			}
+	// rebinds pointers for allocated objects
+	for slotID := 0; slotID < len(slab.memory); slotID++ {
+		obj := &slab.memory[slotID]
+		switch vv := any(obj).(type) {
+		case interface{ Reloc(Relocator[T]) }:
+			vv.Reloc(slabs)
+		default:
+			fmt.Printf("%T\n", vv)
 		}
 	}
 
-	fmt.Printf("===> %v\n", len(slabs.seq))
-
-	for slabID := 0; slabID < len(slabs.seq); slabID++ {
-		slab := slabs.seq[slabID]
-		for slotID := 0; slotID < len(slab.memory); slotID++ {
-			obj := &slab.memory[slotID]
-			switch vv := any(obj).(type) {
-			case interface {
-				SwapOut(interface{ Get(Pointer[T]) Pointer[T] })
-			}:
-				vv.SwapOut(slabs)
-			default:
-				fmt.Printf("%T\n", vv)
-			}
+	// enqueue free slots to heap
+	for _, slot := range slab.slots {
+		if slot.refs == 0 {
+			slabs.enqueueFreeSlot(&slot)
 		}
-
-		// fmt.Printf("%+v\n", slab.memory)
 	}
-
-	return nil
 }
 
 // Rebinds pointer
-func (slabs *tslabs[T]) Get(p Pointer[T]) Pointer[T] {
+func (slabs *tslabs[T]) Reloc(p Pointer[T]) Pointer[T] {
 	if p.slabID == 0 && p.slotID == 0 {
 		return p
 	}
@@ -366,35 +316,4 @@ func (slabs *tslabs[T]) Get(p Pointer[T]) Pointer[T] {
 		slabID:  p.slabID,
 		slotID:  p.slotID,
 	}
-}
-
-// ---------------------------------------------------------------
-
-func (slab tslab[T]) MarshalBinary() ([]byte, error) {
-	var wire bytes.Buffer
-	enc := gob.NewEncoder(&wire)
-
-	if err := enc.Encode(slab.slots); err != nil {
-		return nil, err
-	}
-
-	if err := enc.Encode(slab.memory); err != nil {
-		return nil, err
-	}
-
-	return wire.Bytes(), nil
-}
-
-func (p *tslab[T]) UnmarshalBinary(data []byte) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
-
-	if err := dec.Decode(&p.slots); err != nil {
-		return err
-	}
-
-	if err := dec.Decode(&p.memory); err != nil {
-		return err
-	}
-
-	return nil
 }

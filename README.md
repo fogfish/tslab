@@ -4,7 +4,7 @@ A slab-like allocator library in the Go Programming Language. Classical [slab al
 
 ## Inspiration
 
-The library helps to reduce number of GC and implement allocation pools for generic objects of type `T`. It is solve developed to address the challenge of data co-allocation within data structures
+The library helps to reduce number of GC and implement allocation pools for generic objects of type `T`. It is developed to address the challenge of data co-allocation within data structures and externalize (swap in/out) the allocated slabs. 
 
 ## Getting started
 
@@ -13,17 +13,26 @@ The latest version of the library is available at `main` branch of this reposito
 ```go
 import "github.com/fogfish/tslab"
 
-// data structure uses `tslab.Ptr[T]` type instead of build-in pointer type
+// data structure uses `tslab.Pointer[T]`, which contains both
+// pointer to struct and metadata about allocations
 type Node struct {
-  left, right tslab.Ptr[Node]
+  left, right tslab.Pointer[Node]
   value       int
+}
+
+// Allocate and initialize memory 
+func New(heap tslab.Allocator[Node], value int) NodeID { 
+  addr := heap.Alloc()
+  node := addr.ValueOf
+	node.Value = value
+  return addr
 }
 
 // heap implements an allocator for the given type
 var heap *tslab.Heap[Node] = tslab.New[Node](4 * 1024)
 
-// allocate instance from heap
-ptr, node := heap.Alloc()
+// Use the node
+var node NodeID = New(heap, 10)
 ```
 
 
