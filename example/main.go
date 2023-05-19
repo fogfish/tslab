@@ -10,29 +10,54 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"runtime"
-	"time"
+	"strings"
 
+	"github.com/fogfish/tslab"
 	"github.com/fogfish/tslab/example/bst"
 )
 
 func main() {
-	t := time.Now()
-	_, tree := bst.New(0, 17)
-	tc := time.Since(t)
 
-	// 2^(h+1) - 1
-	t = time.Now()
-	n := bst.Count(tree)
-	tf := time.Since(t)
+	// tree := bst.New(0, 4)
 
-	fmt.Printf("binary tree\t%v nodes\n", n)
-	fmt.Printf("created in\t%v\t(%v ns/op)\n", tc, tc.Nanoseconds()/int64(n))
-	fmt.Printf("folded in\t%v\t(%v ns/op)\n", tf, tf.Nanoseconds()/int64(n))
+	// sb := strings.Builder{}
+	// bst.Print(&sb, 0, tree.ValueOf)
+	// fmt.Println(sb.String())
 
-	runtime.GC()
-	MemUsage()
+	// b, _ := bst.Heap.DumpX()
+	// // fmt.Printf("%v %+x\n", err, b)
+
+	// os.WriteFile("xxx.gob", b, 0777)
+	// fmt.Println(tree)
+
+	dat, _ := os.ReadFile("xxx.gob")
+
+	err := bst.Heap.UnDump(dat)
+	fmt.Println(err)
+
+	tx := bst.Heap.Get(tslab.NewP[bst.Node](0, 1))
+	fmt.Println(tx, tx.ValueOf, tx.ValueOf.LH, tx.ValueOf.RH)
+
+	bs := strings.Builder{}
+	bst.Print(&bs, 0, tx.ValueOf)
+	fmt.Println(bs.String())
 }
+
+// b, err := json.Marshal(tree.Unpack())
+// fmt.Printf("%v %v\n", err, string(b))
+
+// var nn bst.Node
+// err = json.Unmarshal(b, &nn)
+// fmt.Printf("%v %v\n", err, nn)
+
+// fmt.Printf("binary tree\t%v nodes\n", n)
+// fmt.Printf("created in\t%v\t(%v ns/op)\n", tc, tc.Nanoseconds()/int64(n))
+// fmt.Printf("folded in\t%v\t(%v ns/op)\n", tf, tf.Nanoseconds()/int64(n))
+
+// runtime.GC()
+// MemUsage()
 
 func MemUsage() {
 	var m runtime.MemStats

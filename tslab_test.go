@@ -20,10 +20,9 @@ type T struct {
 }
 
 func BenchmarkAlloc(b *testing.B) {
-	b.ReportAllocs()
-
 	heap := tslab.New[T](16 * 1024)
 
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		heap.Alloc()
 	}
@@ -32,8 +31,19 @@ func BenchmarkAlloc(b *testing.B) {
 func BenchmarkAllocFree(b *testing.B) {
 	heap := tslab.New[T](16 * 1024)
 
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		p, _ := heap.Alloc()
+		p := heap.Alloc()
 		heap.Free(p)
 	}
 }
+
+// func BenchmarkRef(b *testing.B) {
+// 	heap := tslab.New[T](16*1024, unsafe.Sizeof(T{}))
+// 	p := heap.Alloc()
+
+// 	b.ReportAllocs()
+// 	for i := 0; i < b.N; i++ {
+// 		heap.Ref(p)
+// 	}
+// }
